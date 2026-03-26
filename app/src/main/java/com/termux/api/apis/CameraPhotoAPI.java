@@ -16,6 +16,7 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Size;
 import android.view.Surface;
 import android.view.WindowManager;
@@ -37,6 +38,8 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class CameraPhotoAPI {
 
@@ -77,7 +80,10 @@ public class CameraPhotoAPI {
     }
 
     private static void takePicture(final PrintWriter stdout, final Context context, final File outputFile, String cameraId) {
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        PowerManager.WakeLock wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "termux-api:camera");
         try {
+            wakeLock.acquire(60 * 1000L); // 60s timeout safety net
             final CameraManager manager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
 
             Looper.prepare();
@@ -110,6 +116,8 @@ public class CameraPhotoAPI {
             Looper.loop();
         } catch (Exception e) {
             Logger.logStackTraceWithMessage(LOG_TAG, "Error getting camera", e);
+        } finally {
+            if (wakeLock.isHeld()) wakeLock.release();
         }
     }
 
@@ -138,6 +146,7 @@ public class CameraPhotoAPI {
         List<Size> sizes = Arrays.asList(map.getOutputSizes(ImageFormat.JPEG));
         Size largest = Collections.max(sizes, bySize);
 
+        final CountDownLatch imageWrittenLatch = new CountDownLatch(1);
         final ImageReader mImageReader = ImageReader.newInstance(largest.getWidth(), largest.getHeight(), ImageFormat.JPEG, 2);
         mImageReader.setOnImageAvailableListener(reader -> new Thread() {
             @Override
@@ -153,6 +162,7 @@ public class CameraPhotoAPI {
                         Logger.logStackTraceWithMessage(LOG_TAG, "Error writing image", e);
                     }
                 } finally {
+                    imageWrittenLatch.countDown();
                     mImageReader.close();
                     releaseSurfaces(outputSurfaces);
                     closeCamera(camera, looper);
@@ -177,10 +187,10 @@ public class CameraPhotoAPI {
                     previewReq.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
                     previewReq.set(CaptureRequest.CONTROL_AE_MODE, autoExposureModeFinal);
 
-                    // continous preview-capture for 1/2 second
+                    // continuous preview-capture for AF/AE stabilization
                     session.setRepeatingRequest(previewReq.build(), null, null);
                     Logger.logInfo(LOG_TAG, "preview started");
-                    Thread.sleep(500);
+                    Thread.sleep(1500);
                     session.stopRepeating();
                     Logger.logInfo(LOG_TAG, "preview stoppend");
 
@@ -192,7 +202,7 @@ public class CameraPhotoAPI {
                     jpegRequest.set(CaptureRequest.CONTROL_AE_MODE, autoExposureModeFinal);
                     jpegRequest.set(CaptureRequest.JPEG_ORIENTATION, correctOrientation(context, characteristics));
 
-                    saveImage(camera, session, jpegRequest.build());
+                    saveImage(camera, session, jpegRequest.build(), imageWrittenLatch);
                 } catch (Exception e) {
                     Logger.logStackTraceWithMessage(LOG_TAG, "onConfigured() error in preview", e);
                     mImageReader.close();
@@ -211,11 +221,17 @@ public class CameraPhotoAPI {
         }, null);
     }
 
-    static void saveImage(final CameraDevice camera, CameraCaptureSession session, CaptureRequest request) throws CameraAccessException {
+    static void saveImage(final CameraDevice camera, CameraCaptureSession session, CaptureRequest request, final CountDownLatch imageWrittenLatch) throws CameraAccessException {
         session.capture(request, new CameraCaptureSession.CaptureCallback() {
             @Override
             public void onCaptureCompleted(CameraCaptureSession completedSession, CaptureRequest request, TotalCaptureResult result) {
                 Logger.logInfo(LOG_TAG, "onCaptureCompleted()");
+                try {
+                    // Wait for ImageReader callback to finish writing before returning
+                    imageWrittenLatch.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Logger.logError(LOG_TAG, "Interrupted waiting for image write: " + e.getMessage());
+                }
             }
         }, null);
     }
